@@ -1,0 +1,38 @@
+
+# 每隔 n 秒循环探测一次
+loop_time: 10
+# 探测次数: 连续几次探测成功判定为就绪 / 连续几次失败判定为不可用
+probe_count: 2
+# 探测失败重试次数: 一次探测如果失败就立即重试，最多尝试 n 次
+probe_retry: 2
+# 单次探测超时时间，秒 (若填写 >1000 则按毫秒处理)
+probe_timeout: 4
+# 候选节点切换模式: priority (按列表顺序，默认) / latency (按最低延迟)
+switch_mode: priority
+# 探测网络代理 (支持 http://, https://, socks5://)，留空表示直连或遵循系统环境变量
+probe_proxy: ""
+# Cloudflare API 网络代理 (支持 http://, https://, socks5://)，留空表示直连或遵循系统环境变量
+cf_proxy: "http://127.0.0.1:7890"
+
+# Cloudflare 相关的公共配置
+cf:
+  # API Token，建议只授予该 Zone 的 "Zone / DNS / Edit" 权限 (也可通过环境变量 CF_API_TOKEN 传入)
+  api_token: ""
+  # Zone ID (也可通过环境变量 CF_ZONE_ID 传入)
+  zone_id: ""
+  # 需要被切换指向的 DNS 记录(完整域名)
+  record_name: "xxx.xxx.cc"
+  # 记录类型: A / AAAA / CNAME
+  record_type: "CNAME"
+  # TTL, 单位秒。1 表示 Auto。proxied 为 true 时会被 Cloudflare 忽略并强制 Auto
+  ttl: 60
+  # 是否开启 Cloudflare CDN 代理
+  proxied: false
+
+# 候选节点列表，按优先级从高到低排列，越靠前优先级越高
+# detect: 探测地址；value: 选中时 DNS 记录指向的值 (A/AAAA 填 IP，CNAME 填域名)
+list:
+  - detect: "https://xx1.xxx.cc"
+    value: "frp1.cc"
+  - detect: "https://xx2.xxx.cc"
+    value: "frp2.cc"
