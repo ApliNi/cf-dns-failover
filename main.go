@@ -425,6 +425,14 @@ func loadConfig(path string) (*Config, error) {
 func buildHTTPClient(proxyStr string, timeout time.Duration) (*http.Client, error) {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
+		// 连接池与生命周期管理: 长期运行时复用 TCP/TLS 连接, 避免连接数无限增长
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   8,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 
 	if proxyStr != "" {
@@ -439,6 +447,16 @@ func buildHTTPClient(proxyStr string, timeout time.Duration) (*http.Client, erro
 		Transport: transport,
 		Timeout:   timeout,
 	}, nil
+}
+
+// drainAndCloseBody 排空并关闭响应体: 未读完的 body 会阻止 keep-alive 连接归还连接池,
+// 导致每次请求都重新建立 TCP/TLS 连接, 长期运行产生海量连接
+func drainAndCloseBody(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
+	_ = body.Close()
 }
 
 // ============================================================
@@ -544,9 +562,8 @@ func (a *FailoverApp) cfRequest(method, path string, bodyData []byte) (*CFRespon
 		}
 		return nil, errors.New(errStr), false
 	}
-	defer resp.Body.Close()
-
 	respBytes, err := io.ReadAll(resp.Body)
+	drainAndCloseBody(resp.Body)
 	if err != nil {
 		return nil, err, false
 	}
@@ -666,7 +683,7 @@ func (a *FailoverApp) probeNodeOnce(s *NodeState) probeResult {
 			errStr:   errStr,
 		}
 	}
-	defer resp.Body.Close()
+	drainAndCloseBody(resp.Body)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		return probeResult{
@@ -697,6 +714,10 @@ func (a *FailoverApp) probeNode(s *NodeState) probeResult {
 			return res
 		}
 		lastRes = res
+		// 失败退避: 节点不可达时立即重试只会在短窗口内高频建立连接, 逐次递增等待缓解连接风暴
+		if attempt < maxTries {
+			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+		}
 	}
 	return lastRes
 }
