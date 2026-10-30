@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,15 +33,16 @@ const (
 )
 
 type Config struct {
-	LoopTime     int             `json:"loop_time"`
-	ProbeCount   int             `json:"probe_count"`
-	ProbeRetry   int             `json:"probe_retry"`
-	ProbeTimeout int             `json:"probe_timeout"`
-	ProbeProxy   string          `json:"probe_proxy"`
-	CFProxy      string          `json:"cf_proxy"`
-	SwitchMode   string          `json:"switch_mode"`
-	CF           CFConfig        `json:"cf"`
-	List         []CandidateNode `json:"list"`
+	LoopTime         int             `json:"loop_time"`
+	ProbeCount       int             `json:"probe_count"`
+	ProbeRetry       int             `json:"probe_retry"`
+	ProbeTimeout     int             `json:"probe_timeout"`
+	ProbeProxy       string          `json:"probe_proxy"`
+	CFProxy          string          `json:"cf_proxy"`
+	SwitchMode       string          `json:"switch_mode"`
+	SyncCandidateDNS bool            `json:"sync_candidate_dns"`
+	CF               CFConfig        `json:"cf"`
+	List             []CandidateNode `json:"list"`
 
 	// 兼容旧版及别名配置字段
 	Count     int `json:"count"`
@@ -50,13 +52,14 @@ type Config struct {
 }
 
 type CFConfig struct {
-	APIToken   string `json:"api_token"`
-	ZoneID     string `json:"zone_id"`
-	RecordName string `json:"record_name"`
-	RecordType string `json:"record_type"`
-	TTL        int    `json:"ttl"`
-	Proxied    bool   `json:"proxied"`
-	Proxy      string `json:"proxy"`
+	APIToken         string `json:"api_token"`
+	ZoneID           string `json:"zone_id"`
+	RecordName       string `json:"record_name"`
+	RecordType       string `json:"record_type"`
+	TTL              int    `json:"ttl"`
+	Proxied          bool   `json:"proxied"`
+	Proxy            string `json:"proxy"`
+	SyncCandidateDNS bool   `json:"sync_candidate_dns"`
 }
 
 type CandidateNode struct {
@@ -112,6 +115,8 @@ type CFError struct {
 	Message string `json:"message"`
 }
 
+var ErrRecordNotFound = errors.New("未在 zone 中找到记录")
+
 // ============================================================
 // 日志辅助工具
 // ============================================================
@@ -134,46 +139,56 @@ type lineInfo struct {
 }
 
 func parseYAML(content []byte) (map[string]any, error) {
-	trimmed := bytes.TrimSpace(content)
-	if len(trimmed) > 0 && trimmed[0] == '{' {
-		var res map[string]any
-		err := json.Unmarshal(content, &res)
-		return res, err
+	trimmedContent := bytes.TrimSpace(content)
+	if len(trimmedContent) > 0 && trimmedContent[0] == '{' {
+		var m map[string]any
+		if err := json.Unmarshal(trimmedContent, &m); err == nil {
+			return m, nil
+		}
 	}
 
-	var lines []lineInfo
 	scanner := bufio.NewScanner(bytes.NewReader(content))
+	var lines []lineInfo
+
 	for scanner.Scan() {
 		raw := scanner.Text()
-		clean := stripComment(raw)
-		if strings.TrimSpace(clean) == "" {
+		stripped := stripComment(raw)
+		clean := strings.ReplaceAll(stripped, "\t", "  ")
+		trimmed := strings.TrimRight(clean, " \t\r\n")
+		if strings.TrimSpace(trimmed) == "" {
 			continue
 		}
-		clean = strings.ReplaceAll(clean, "\t", "  ")
-		indent := len(clean) - len(strings.TrimLeft(clean, " "))
-		text := strings.TrimSpace(clean)
+
+		indent := 0
+		for indent < len(trimmed) && trimmed[indent] == ' ' {
+			indent++
+		}
+		text := strings.TrimSpace(trimmed)
 		lines = append(lines, lineInfo{indent: indent, text: text})
 	}
 
-	if len(lines) == 0 {
-		return make(map[string]any), nil
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
 	root := make(map[string]any)
 	_, err := parseMapping(lines, 0, 0, root)
-	return root, err
+	if err != nil {
+		return nil, err
+	}
+	return root, nil
 }
 
 func stripComment(s string) string {
 	inSingle := false
 	inDouble := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '\'' && !inDouble {
+	for i := range len(s) {
+		ch := s[i]
+		if ch == '\'' && !inDouble {
 			inSingle = !inSingle
-		} else if c == '"' && !inSingle {
+		} else if ch == '"' && !inSingle {
 			inDouble = !inDouble
-		} else if c == '#' && !inSingle && !inDouble {
+		} else if ch == '#' && !inSingle && !inDouble {
 			return s[:i]
 		}
 	}
@@ -181,128 +196,137 @@ func stripComment(s string) string {
 }
 
 func parseMapping(lines []lineInfo, startIdx int, minIndent int, target map[string]any) (int, error) {
-	idx := startIdx
-	for idx < len(lines) {
-		line := lines[idx]
+	i := startIdx
+	for i < len(lines) {
+		line := lines[i]
 		if line.indent < minIndent {
 			break
 		}
-		if line.indent > minIndent && minIndent != 0 {
-			break
+		if line.indent > minIndent {
+			return i, fmt.Errorf("unexpected indent at line: %s", line.text)
 		}
 
-		colonPos := strings.Index(line.text, ":")
-		if colonPos == -1 {
-			idx++
-			continue
+		colonIdx := strings.Index(line.text, ":")
+		if colonIdx == -1 {
+			return i, fmt.Errorf("missing colon in mapping: %s", line.text)
 		}
 
-		key := strings.TrimSpace(line.text[:colonPos])
-		valPart := strings.TrimSpace(line.text[colonPos+1:])
+		key := strings.TrimSpace(line.text[:colonIdx])
+		valPart := strings.TrimSpace(line.text[colonIdx+1:])
 
 		if valPart != "" {
 			target[key] = parseScalar(valPart)
-			idx++
-		} else {
-			if idx+1 >= len(lines) {
-				target[key] = nil
-				idx++
-				break
-			}
-			nextLine := lines[idx+1]
-			if nextLine.indent <= line.indent {
-				target[key] = nil
-				idx++
-				continue
-			}
+			i++
+			continue
+		}
 
-			if strings.HasPrefix(nextLine.text, "- ") || nextLine.text == "-" {
-				var list []any
-				nextIdx, err := parseSequence(lines, idx+1, nextLine.indent, &list)
-				if err != nil {
-					return idx, err
-				}
-				target[key] = list
-				idx = nextIdx
-			} else {
-				subMap := make(map[string]any)
-				nextIdx, err := parseMapping(lines, idx+1, nextLine.indent, subMap)
-				if err != nil {
-					return idx, err
-				}
-				target[key] = subMap
-				idx = nextIdx
+		if i+1 >= len(lines) {
+			target[key] = nil
+			i++
+			break
+		}
+
+		nextLine := lines[i+1]
+		if nextLine.indent <= line.indent {
+			target[key] = nil
+			i++
+			continue
+		}
+
+		if strings.HasPrefix(nextLine.text, "- ") || nextLine.text == "-" {
+			var list []any
+			nextI, err := parseSequence(lines, i+1, nextLine.indent, &list)
+			if err != nil {
+				return i, err
 			}
+			target[key] = list
+			i = nextI
+		} else {
+			subMap := make(map[string]any)
+			nextI, err := parseMapping(lines, i+1, nextLine.indent, subMap)
+			if err != nil {
+				return i, err
+			}
+			target[key] = subMap
+			i = nextI
 		}
 	}
-	return idx, nil
+	return i, nil
 }
 
 func parseSequence(lines []lineInfo, startIdx int, seqIndent int, list *[]any) (int, error) {
-	idx := startIdx
-	for idx < len(lines) {
-		line := lines[idx]
+	i := startIdx
+	for i < len(lines) {
+		line := lines[i]
 		if line.indent < seqIndent {
 			break
 		}
-		if !strings.HasPrefix(line.text, "-") {
+		if line.indent > seqIndent {
+			return i, fmt.Errorf("unexpected sequence indent at: %s", line.text)
+		}
+
+		if !strings.HasPrefix(line.text, "- ") && line.text != "-" {
 			break
 		}
 
-		content := strings.TrimSpace(line.text[1:])
-		if content == "" {
-			if idx+1 < len(lines) && lines[idx+1].indent > line.indent {
-				subMap := make(map[string]any)
-				nextIdx, err := parseMapping(lines, idx+1, lines[idx+1].indent, subMap)
-				if err != nil {
-					return idx, err
+		itemContent := strings.TrimSpace(strings.TrimPrefix(line.text, "-"))
+		if itemContent == "" {
+			if i+1 < len(lines) && lines[i+1].indent > line.indent {
+				nextLine := lines[i+1]
+				if strings.HasPrefix(nextLine.text, "- ") || nextLine.text == "-" {
+					var subList []any
+					nextI, err := parseSequence(lines, i+1, nextLine.indent, &subList)
+					if err != nil {
+						return i, err
+					}
+					*list = append(*list, subList)
+					i = nextI
+				} else {
+					subMap := make(map[string]any)
+					nextI, err := parseMapping(lines, i+1, nextLine.indent, subMap)
+					if err != nil {
+						return i, err
+					}
+					*list = append(*list, subMap)
+					i = nextI
 				}
-				*list = append(*list, subMap)
-				idx = nextIdx
-			} else {
-				*list = append(*list, nil)
-				idx++
+				continue
 			}
-		} else if strings.Contains(content, ":") {
-			itemMap := make(map[string]any)
-			colonPos := strings.Index(content, ":")
-			subKey := strings.TrimSpace(content[:colonPos])
-			subVal := strings.TrimSpace(content[colonPos+1:])
-			if subVal != "" {
-				itemMap[subKey] = parseScalar(subVal)
+			*list = append(*list, nil)
+			i++
+			continue
+		}
+
+		colonIdx := strings.Index(itemContent, ":")
+		if colonIdx != -1 {
+			subMap := make(map[string]any)
+			key := strings.TrimSpace(itemContent[:colonIdx])
+			valPart := strings.TrimSpace(itemContent[colonIdx+1:])
+			if valPart != "" {
+				subMap[key] = parseScalar(valPart)
 			} else {
-				itemMap[subKey] = nil
+				subMap[key] = nil
 			}
 
-			nextIdx := idx + 1
-			itemIndent := -1
-			for nextIdx < len(lines) {
-				nLine := lines[nextIdx]
-				if nLine.indent <= seqIndent {
-					break
+			if i+1 < len(lines) && lines[i+1].indent > line.indent {
+				nextI, err := parseMapping(lines, i+1, lines[i+1].indent, subMap)
+				if err != nil {
+					return i, err
 				}
-				if itemIndent == -1 {
-					itemIndent = nLine.indent
-				}
-				if nLine.indent < itemIndent {
-					break
-				}
-				subColon := strings.Index(nLine.text, ":")
-				if subColon != -1 {
-					k := strings.TrimSpace(nLine.text[:subColon])
-					v := strings.TrimSpace(nLine.text[subColon+1:])
-					itemMap[k] = parseScalar(v)
-				}
-				nextIdx++
+				*list = append(*list, subMap)
+				i = nextI
+				continue
 			}
-			*list = append(*list, itemMap)
-			idx = nextIdx
-		} else {
-			*list = append(*list, parseScalar(content))
-			idx++
+
+			*list = append(*list, subMap)
+			i++
+			continue
 		}
+
+		*list = append(*list, parseScalar(itemContent))
+		i++
 	}
-	return idx, nil
+	return i, nil
 }
 
 func parseScalar(s string) any {
@@ -330,6 +354,63 @@ func parseScalar(s string) any {
 		return f
 	}
 	return s
+}
+
+// extractDomain 从探测地址中提取规范化的域名 (转换为小写并剔除协议、端口与路径)
+func extractDomain(detect string) (string, error) {
+	detect = strings.TrimSpace(detect)
+	if detect == "" {
+		return "", errors.New("detect 地址为空")
+	}
+
+	raw := detect
+	if strings.HasPrefix(raw, "//") {
+		raw = "http:" + raw
+	} else {
+		schemeIdx := strings.Index(raw, "://")
+		firstSepIdx := strings.IndexAny(raw, "/?#")
+		hasScheme := schemeIdx != -1 && (firstSepIdx == -1 || schemeIdx < firstSepIdx)
+		if !hasScheme {
+			raw = "http://" + raw
+		}
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("解析 detect 地址失败: %w", err)
+	}
+
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("未能从 [%s] 中提取有效主机名", detect)
+	}
+
+	host = strings.TrimSuffix(host, ".")
+
+	if net.ParseIP(host) != nil {
+		return "", fmt.Errorf("[%s] 是 IP 地址而非域名", host)
+	}
+
+	if !strings.Contains(host, ".") {
+		return "", fmt.Errorf("[%s] 不是有效域名", host)
+	}
+
+	parts := strings.Split(host, ".")
+	for _, part := range parts {
+		if len(part) == 0 || len(part) > 63 {
+			return "", fmt.Errorf("域名标签长度不合法: [%s]", host)
+		}
+		if strings.HasPrefix(part, "-") || strings.HasSuffix(part, "-") {
+			return "", fmt.Errorf("域名标签不能以短横线开头或结尾: [%s]", host)
+		}
+		for _, r := range part {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+				return "", fmt.Errorf("域名包含非法字符 %q: [%s]", r, host)
+			}
+		}
+	}
+
+	return strings.ToLower(host), nil
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -364,6 +445,12 @@ func loadConfig(path string) (*Config, error) {
 	// 代理字段兼容
 	if cfg.CF.Proxy == "" && cfg.CFProxy != "" {
 		cfg.CF.Proxy = cfg.CFProxy
+	}
+
+	// 候选节点 DNS 同步开关兼容 (支持顶层 sync_candidate_dns 或 cf.sync_candidate_dns)
+	if cfg.SyncCandidateDNS || cfg.CF.SyncCandidateDNS {
+		cfg.SyncCandidateDNS = true
+		cfg.CF.SyncCandidateDNS = true
 	}
 
 	// 默认参数补齐
@@ -426,13 +513,9 @@ func buildHTTPClient(proxyStr string, timeout time.Duration) (*http.Client, erro
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		// 连接池与生命周期管理: 长期运行时复用 TCP/TLS 连接, 避免连接数无限增长
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   8,
-		MaxConnsPerHost:       0,
-		IdleConnTimeout:       60 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
 	}
 
 	if proxyStr != "" {
@@ -467,6 +550,7 @@ type FailoverApp struct {
 	cfg         *Config
 	cfClient    *http.Client
 	probeClient *http.Client
+	cfBaseURL   string
 
 	state         []*NodeState
 	dnsRecordID   string
@@ -533,13 +617,18 @@ func NewFailoverApp(cfg *Config) (*FailoverApp, error) {
 		cfg:         cfg,
 		cfClient:    cfClient,
 		probeClient: probeClient,
+		cfBaseURL:   "https://api.cloudflare.com/client/v4",
 		state:       state,
 		activeIndex: -1,
 	}, nil
 }
 
 func (a *FailoverApp) cfRequest(method, path string, bodyData []byte) (*CFResponse, error, bool) {
-	apiURL := "https://api.cloudflare.com/client/v4" + path
+	baseURL := a.cfBaseURL
+	if baseURL == "" {
+		baseURL = "https://api.cloudflare.com/client/v4"
+	}
+	apiURL := baseURL + path
 
 	var bodyReader io.Reader
 	if len(bodyData) > 0 {
@@ -563,7 +652,7 @@ func (a *FailoverApp) cfRequest(method, path string, bodyData []byte) (*CFRespon
 		return nil, errors.New(errStr), false
 	}
 	respBytes, err := io.ReadAll(resp.Body)
-	drainAndCloseBody(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil {
 		return nil, err, false
 	}
@@ -595,10 +684,12 @@ func (a *FailoverApp) cfRequest(method, path string, bodyData []byte) (*CFRespon
 	return &cfResp, nil, false
 }
 
-func (a *FailoverApp) fetchDnsRecord() (*DnsRecord, error, bool) {
+func (a *FailoverApp) fetchDnsRecordByName(name, recordType string) (*DnsRecord, error, bool) {
 	qs := url.Values{}
-	qs.Set("type", a.cfg.CF.RecordType)
-	qs.Set("name", a.cfg.CF.RecordName)
+	if recordType != "" {
+		qs.Set("type", recordType)
+	}
+	qs.Set("name", name)
 
 	path := fmt.Sprintf("/zones/%s/dns_records?%s", a.cfg.CF.ZoneID, qs.Encode())
 	cfResp, err, isAuth := a.cfRequest("GET", path, nil)
@@ -607,31 +698,157 @@ func (a *FailoverApp) fetchDnsRecord() (*DnsRecord, error, bool) {
 	}
 
 	if len(cfResp.Result) == 0 {
-		return nil, fmt.Errorf("未在 zone [%s] 中找到记录: %s (%s)",
-			a.cfg.CF.ZoneID, a.cfg.CF.RecordName, a.cfg.CF.RecordType), false
+		if recordType != "" {
+			return nil, fmt.Errorf("%w [%s]: %s (%s)", ErrRecordNotFound, a.cfg.CF.ZoneID, name, recordType), false
+		}
+		return nil, fmt.Errorf("%w [%s]: %s", ErrRecordNotFound, a.cfg.CF.ZoneID, name), false
 	}
 
 	return &cfResp.Result[0], nil, false
 }
 
-func (a *FailoverApp) patchDnsRecord(item *CandidateNode) error {
-	path := fmt.Sprintf("/zones/%s/dns_records/%s", a.cfg.CF.ZoneID, a.dnsRecordID)
+func (a *FailoverApp) fetchDnsRecord() (*DnsRecord, error, bool) {
+	return a.fetchDnsRecordByName(a.cfg.CF.RecordName, a.cfg.CF.RecordType)
+}
+
+func (a *FailoverApp) updateDnsRecord(recordID, content string, ttl int, proxied bool) (error, bool) {
+	path := fmt.Sprintf("/zones/%s/dns_records/%s", a.cfg.CF.ZoneID, recordID)
 	payload := map[string]any{
-		"content": item.Value,
-		"ttl":     a.cfg.CF.TTL,
-		"proxied": a.cfg.CF.Proxied,
+		"content": content,
+		"ttl":     ttl,
+		"proxied": proxied,
 	}
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return err, false
 	}
 
-	_, err, _ = a.cfRequest("PATCH", path, payloadBytes)
+	_, err, isAuth := a.cfRequest("PATCH", path, payloadBytes)
+	return err, isAuth
+}
+
+func (a *FailoverApp) patchDnsRecord(item *CandidateNode) error {
+	err, _ := a.updateDnsRecord(a.dnsRecordID, item.Value, a.cfg.CF.TTL, a.cfg.CF.Proxied)
 	return err
 }
 
-func (a *FailoverApp) Initialize() error {
+func (a *FailoverApp) syncCandidateDnsRecords() error {
+	if !a.cfg.SyncCandidateDNS {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	type candidateTarget struct {
+		domain    string
+		candidate CandidateNode
+	}
+	var targets []candidateTarget
+
+	for _, item := range a.cfg.List {
+		domain, err := extractDomain(item.Detect)
+		if err != nil {
+			continue
+		}
+		if seen[domain] {
+			continue
+		}
+		seen[domain] = true
+		targets = append(targets, candidateTarget{
+			domain:    domain,
+			candidate: item,
+		})
+	}
+
+	if len(targets) == 0 {
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	var authErrMu sync.Mutex
+	var authErr error
+
+	for _, t := range targets {
+		wg.Add(1)
+		go func(target candidateTarget) {
+			defer wg.Done()
+
+			authErrMu.Lock()
+			hasAuthErr := (authErr != nil)
+			authErrMu.Unlock()
+			if hasAuthErr {
+				return
+			}
+
+			expectedType := "CNAME"
+			if ip := net.ParseIP(strings.TrimSpace(target.candidate.Value)); ip != nil {
+				if ip.To4() != nil {
+					expectedType = "A"
+				} else {
+					expectedType = "AAAA"
+				}
+			}
+
+			record, err, isAuth := a.fetchDnsRecordByName(target.domain, expectedType)
+			if isAuth {
+				authErrMu.Lock()
+				if authErr == nil {
+					authErr = err
+				}
+				authErrMu.Unlock()
+				return
+			}
+
+			if err != nil {
+				if errors.Is(err, ErrRecordNotFound) {
+					logInfo("警告: 未在 zone [%s] 中找到候选域名 [%s] 的 DNS 记录, 跳过更新", a.cfg.CF.ZoneID, target.domain)
+				} else {
+					logInfo("查询候选域名 [%s] DNS 记录失败: %s", target.domain, err.Error())
+				}
+				return
+			}
+
+			ipRecord := net.ParseIP(strings.TrimSpace(record.Content))
+			ipCandidate := net.ParseIP(strings.TrimSpace(target.candidate.Value))
+			equal := false
+			if ipRecord != nil && ipCandidate != nil {
+				equal = ipRecord.Equal(ipCandidate)
+			} else {
+				equal = strings.EqualFold(strings.TrimSpace(record.Content), strings.TrimSpace(target.candidate.Value))
+			}
+
+			if equal {
+				logInfo("候选域名 [%s] DNS 记录已对等 (%s), 无需更新", target.domain, record.Content)
+				return
+			}
+
+			updateErr, updateIsAuth := a.updateDnsRecord(record.ID, target.candidate.Value, record.TTL, record.Proxied)
+			if updateIsAuth {
+				authErrMu.Lock()
+				if authErr == nil {
+					authErr = updateErr
+				}
+				authErrMu.Unlock()
+				return
+			}
+			if updateErr != nil {
+				logInfo("更新候选域名 [%s] DNS 记录失败: %s", target.domain, updateErr.Error())
+				return
+			}
+
+			logInfo("候选域名 [%s] DNS 记录已更新: %s -> %s", target.domain, record.Content, target.candidate.Value)
+		}(t)
+	}
+
+	wg.Wait()
+
+	if authErr != nil {
+		return authErr
+	}
+	return nil
+}
+
+func (a *FailoverApp) initPrimaryRecord() error {
 	for {
 		record, err, isAuth := a.fetchDnsRecord()
 		if err == nil {
@@ -651,12 +868,42 @@ func (a *FailoverApp) Initialize() error {
 		}
 
 		logInfo("查询 DNS 记录失败: %s", err.Error())
-		if isAuth {
+		if isAuth || errors.Is(err, ErrRecordNotFound) {
 			return err
 		}
 
 		time.Sleep(5 * time.Second)
 	}
+}
+
+func (a *FailoverApp) Initialize() error {
+	var wg sync.WaitGroup
+	var primaryErr error
+	var candidateErr error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		primaryErr = a.initPrimaryRecord()
+	}()
+
+	if a.cfg.SyncCandidateDNS {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			candidateErr = a.syncCandidateDnsRecords()
+		}()
+	}
+
+	wg.Wait()
+
+	if primaryErr != nil {
+		return primaryErr
+	}
+	if candidateErr != nil {
+		return candidateErr
+	}
+	return nil
 }
 
 type probeResult struct {
@@ -946,8 +1193,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	logInfo("启动 cf-dns-failover: loop_time=%ds probe_count=%d probe_retry=%d 候选数=%d",
-		cfg.LoopTime, cfg.ProbeCount, cfg.ProbeRetry, len(cfg.List))
+	logInfo("启动 cf-dns-failover: loop_time=%ds probe_count=%d probe_retry=%d sync_candidate_dns=%v 候选数=%d",
+		cfg.LoopTime, cfg.ProbeCount, cfg.ProbeRetry, cfg.SyncCandidateDNS, len(cfg.List))
 
 	app, err := NewFailoverApp(cfg)
 	if err != nil {

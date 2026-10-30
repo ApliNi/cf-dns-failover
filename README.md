@@ -12,6 +12,7 @@
 - **双切换策略模式**：
   - **按列表顺序（priority，默认）**：配置列表中越靠前优先级越高，当前节点健康时仅更高优先级节点恢复才回切抢占。
   - **按最低延迟（latency）**：动态监测各就绪节点的实时 RTT 延迟，自动将 DNS 指向当前响应最快的健康节点。
+- **候选节点 DNS 自动同步**：支持可选开关（`cf.sync_candidate_dns`）。开启后在软件启动时自动从候选节点的 `detect` 探测地址中提取域名，与主解析记录并发向 Cloudflare 探测该域名记录；若候选域名的当前 DNS 记录值与配置中的目标 `value` 不对等，则自动将其同步更新为 `value`，确保各候选节点的基础解析准确无误。
 - **独立网络代理**：支持分别针对 Cloudflare API (`cf_proxy` / `cf.proxy`) 与目标探测 (`probe_proxy`) 配置独立的 HTTP / HTTPS / SOCKS5 代理。
 - **探测重试与稳健状态机**：
   - **探测失败立即重试**：单次探测遇到网络波动或异常立即就地重试（最多 `probe_retry` 次），任意一次成功即视为健康，只有重试全部失败才计入失败；重试间附带递增退避延迟，节点宕机时不会产生高频连接风暴。
@@ -32,6 +33,7 @@
 
 1. **初始化阶段**
    - 检查 Cloudflare 中指定 `record_name` 与 `record_type` 的 DNS 记录值。
+   - 若开启了候选节点 DNS 同步（`sync_candidate_dns: true`），将在启动时自动从所有候选节点的 `detect` 探测地址中提取域名，与主记录 `record_name` 并发向 Cloudflare 探测并查询记录；若某个候选域名的 DNS 记录值与配置中的 `value` 不对等，则自动将其更新为配置中的目标 `value`。
    - 若返回鉴权错误（HTTP 401/403 或 Cloudflare 认证错误码），立即退出脚本；
    - 若出现网络抖动、DNS 暂时不可达等其他错误，保持间隔循环重试，直至请求成功；
    - 成功获取记录后，确定当前 DNS 记录所指向的候选节点。
@@ -89,6 +91,10 @@ cf:
   ttl: 60
   # 是否开启 Cloudflare CDN 代理
   proxied: false
+  # 启动时是否自动探测并更新所有候选节点的 DNS 记录 (默认: false，按需开启)
+  # 开启后，在软件启动时自动从候选节点的 detect 探测地址中提取域名，并发向 Cloudflare 探测该域名记录，
+  # 若该域名的 DNS 记录值与配置中的 value 不对等，则自动将其更新为 value
+  sync_candidate_dns: false
 
 # 候选节点列表，按优先级从高到低排列，越靠前优先级越高
 # detect: 探测地址；value: 选中时 DNS 记录指向的值 (A/AAAA 填 IP，CNAME 填域名)
@@ -98,6 +104,13 @@ list:
   - detect: "https://xx2.xxx.cc"
     value: "frp2.cc"
 ```
+
+### 核心字段解释
+
+- `cf.sync_candidate_dns`：布尔值，默认 `false`。
+  - **作用**：控制软件启动时是否自动探测并同步更新所有候选节点的 DNS 记录。
+  - **提取规则**：自动从各候选节点的 `detect` 探测地址中提取其域名部分（例如从 `https://xx1.xxx.cc/path` 提取出 `xx1.xxx.cc`）。
+  - **比对与更新**：在初始化阶段与 `cf.record_name` 并发向 Cloudflare 查询该域名的 DNS 记录。若查询到的 DNS 记录值与候选配置中的目标 `value` 不对等，则自动更新为 `value`。
 
 ### 环境变量支持
 
