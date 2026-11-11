@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,24 +26,35 @@ import (
 // 配置结构体定义
 // ============================================================
 
-type SwitchMode string
+type SwitchStrategy string
 
 const (
-	SwitchModePriority SwitchMode = "priority"
-	SwitchModeLatency  SwitchMode = "latency"
+	StrategyStability SwitchStrategy = "stability"
+	StrategyLatency   SwitchStrategy = "latency"
+	StrategyPriority  SwitchStrategy = "priority"
 )
 
+const DefaultStabilityWindow = 30
+
+var DefaultSwitchStrategies = []SwitchStrategy{
+	StrategyStability,
+	StrategyLatency,
+	StrategyPriority,
+}
+
 type Config struct {
-	LoopTime         int             `json:"loop_time"`
-	ProbeCount       int             `json:"probe_count"`
-	ProbeRetry       int             `json:"probe_retry"`
-	ProbeTimeout     int             `json:"probe_timeout"`
-	ProbeProxy       string          `json:"probe_proxy"`
-	CFProxy          string          `json:"cf_proxy"`
-	SwitchMode       string          `json:"switch_mode"`
-	SyncCandidateDNS bool            `json:"sync_candidate_dns"`
-	CF               CFConfig        `json:"cf"`
-	List             []CandidateNode `json:"list"`
+	LoopTime         int              `json:"loop_time"`
+	ProbeCount       int              `json:"probe_count"`
+	ProbeRetry       int              `json:"probe_retry"`
+	ProbeTimeout     int              `json:"probe_timeout"`
+	ProbeProxy       string           `json:"probe_proxy"`
+	CFProxy          string           `json:"cf_proxy"`
+	SwitchMode       string           `json:"switch_mode"`
+	StabilityWindow  int              `json:"stability_window"`
+	SwitchStrategies []SwitchStrategy `json:"-"`
+	SyncCandidateDNS bool             `json:"sync_candidate_dns"`
+	CF               CFConfig         `json:"cf"`
+	List             []CandidateNode  `json:"list"`
 
 	// 兼容旧版及别名配置字段
 	Count     int `json:"count"`
@@ -88,6 +100,41 @@ type NodeState struct {
 	FailStreak   int
 	LastDuration int64
 	LastError    string
+	History      []bool
+}
+
+func (s *NodeState) RecordProbe(ok bool, maxWindow int) {
+	if maxWindow <= 0 {
+		maxWindow = DefaultStabilityWindow
+	}
+	s.History = append(s.History, ok)
+	if len(s.History) > maxWindow {
+		s.History = s.History[len(s.History)-maxWindow:]
+	}
+}
+
+func (s *NodeState) StabilityRate() float64 {
+	if len(s.History) == 0 {
+		return 0.0
+	}
+	successCount := 0
+	for _, ok := range s.History {
+		if ok {
+			successCount++
+		}
+	}
+	return float64(successCount) / float64(len(s.History))
+}
+
+func (s *NodeState) EventOkStreak() int {
+	streak := 0
+	for i := len(s.History) - 1; i >= 0; i-- {
+		if !s.History[i] {
+			break
+		}
+		streak++
+	}
+	return streak
 }
 
 type Decision struct {
@@ -356,6 +403,57 @@ func parseScalar(s string) any {
 	return s
 }
 
+func normalizeStrategyToken(token string) (SwitchStrategy, bool) {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "stability", "stable", "history", "稳定性", "历史稳定性":
+		return StrategyStability, true
+	case "latency", "lowest_latency", "min_latency", "rtt", "延迟", "最低延迟":
+		return StrategyLatency, true
+	case "priority", "order", "list", "顺序", "列表顺序", "优先级":
+		return StrategyPriority, true
+	default:
+		return "", false
+	}
+}
+
+func parseSwitchMode(raw string) ([]SwitchStrategy, string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return append([]SwitchStrategy(nil), DefaultSwitchStrategies...), "stability,latency,priority", nil
+	}
+
+	norm := strings.ReplaceAll(trimmed, "->", ",")
+	norm = strings.ReplaceAll(norm, ">", ",")
+	norm = strings.ReplaceAll(norm, "，", ",")
+
+	parts := strings.Split(norm, ",")
+	var result []SwitchStrategy
+	var nameStrs []string
+	seen := make(map[SwitchStrategy]bool)
+
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		strat, ok := normalizeStrategyToken(token)
+		if !ok {
+			return nil, "", fmt.Errorf("不支持的切换模式/策略: %s (可选: stability / latency / priority)", token)
+		}
+		if !seen[strat] {
+			seen[strat] = true
+			result = append(result, strat)
+			nameStrs = append(nameStrs, string(strat))
+		}
+	}
+
+	if len(result) == 0 {
+		return append([]SwitchStrategy(nil), DefaultSwitchStrategies...), "stability,latency,priority", nil
+	}
+
+	return result, strings.Join(nameStrs, ","), nil
+}
+
 // extractDomain 从探测地址中提取规范化的域名 (转换为小写并剔除协议、端口与路径)
 func extractDomain(detect string) (string, error) {
 	detect = strings.TrimSpace(detect)
@@ -424,6 +522,13 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("解析配置文件 YAML 失败: %w", err)
 	}
 
+	if rawList, ok := m["switch_mode"].([]any); ok {
+		var parts []string
+		for _, item := range rawList {
+			parts = append(parts, fmt.Sprint(item))
+		}
+		m["switch_mode"] = strings.Join(parts, ",")
+	}
 	rawJSON, err := json.Marshal(m)
 	if err != nil {
 		return nil, fmt.Errorf("格式化配置失败: %w", err)
@@ -492,14 +597,15 @@ func loadConfig(path string) (*Config, error) {
 		cfg.CF.RecordType = "CNAME"
 	}
 
-	cfg.SwitchMode = strings.ToLower(strings.TrimSpace(cfg.SwitchMode))
-	switch cfg.SwitchMode {
-	case "", "priority", "order", "list", "顺序", "列表顺序":
-		cfg.SwitchMode = string(SwitchModePriority)
-	case "latency", "lowest_latency", "min_latency", "延迟", "最低延迟":
-		cfg.SwitchMode = string(SwitchModeLatency)
-	default:
-		return nil, fmt.Errorf("不支持的切换模式 (switch_mode): %s (可选: priority / latency)", cfg.SwitchMode)
+	strategies, normMode, err := parseSwitchMode(cfg.SwitchMode)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SwitchStrategies = strategies
+	cfg.SwitchMode = normMode
+
+	if cfg.StabilityWindow <= 0 {
+		cfg.StabilityWindow = DefaultStabilityWindow
 	}
 
 	return &cfg, nil
@@ -582,6 +688,20 @@ func NewFailoverApp(cfg *Config) (*FailoverApp, error) {
 		} else {
 			cfg.ProbeRetry = 2
 		}
+	}
+
+	if len(cfg.SwitchStrategies) == 0 {
+		strategies, normMode, err := parseSwitchMode(cfg.SwitchMode)
+		if err == nil {
+			cfg.SwitchStrategies = strategies
+			cfg.SwitchMode = normMode
+		} else {
+			cfg.SwitchStrategies = append([]SwitchStrategy(nil), DefaultSwitchStrategies...)
+			cfg.SwitchMode = "stability,latency,priority"
+		}
+	}
+	if cfg.StabilityWindow <= 0 {
+		cfg.StabilityWindow = DefaultStabilityWindow
 	}
 
 	var probeTimeout time.Duration
@@ -999,18 +1119,44 @@ func (a *FailoverApp) applyProbeResult(s *NodeState, res probeResult) bool {
 	return statusChanged
 }
 
+func (a *FailoverApp) hasStabilityStrategy() bool {
+	if a == nil || a.cfg == nil {
+		return false
+	}
+	for _, strat := range a.cfg.SwitchStrategies {
+		if strat == StrategyStability {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *FailoverApp) formatNodeSuffix(s *NodeState) string {
+	if s.Status == StatusHealthy {
+		if a.hasStabilityStrategy() {
+			ratePct := s.StabilityRate() * 100
+			if math.Abs(ratePct-math.Round(ratePct)) < 1e-6 {
+				return fmt.Sprintf("%dms (稳定性 %.0f%%)", s.LastDuration, math.Round(ratePct))
+			}
+			return fmt.Sprintf("%dms (稳定性 %.1f%%)", s.LastDuration, ratePct)
+		}
+		return fmt.Sprintf("%dms", s.LastDuration)
+	}
+	if s.LastError != "" {
+		return s.LastError
+	}
+	return "未就绪"
+}
+
 func (a *FailoverApp) printInitialStatus() {
 	var lines []string
 	lines = append(lines, fmt.Sprintf("[%s] 初始候选状态", nowTime()))
 	for _, s := range a.state {
 		sign := "-"
-		suffix := s.LastError
 		if s.Status == StatusHealthy {
 			sign = "+"
-			suffix = fmt.Sprintf("%dms", s.LastDuration)
-		} else if suffix == "" {
-			suffix = "未就绪"
 		}
+		suffix := a.formatNodeSuffix(s)
 		lines = append(lines, fmt.Sprintf("  - [%s] [%d] %s -> %s - %s",
 			sign, s.Index+1, s.Detect, s.Value, suffix))
 	}
@@ -1024,70 +1170,113 @@ func (a *FailoverApp) printStatusChangeWithTarget(targetIndex int) {
 		nowTime(), targetIndex+1, a.cfg.CF.RecordName, target.Value))
 	for _, s := range a.state {
 		sign := "-"
-		suffix := s.LastError
 		if s.Status == StatusHealthy {
 			sign = "+"
-			suffix = fmt.Sprintf("%dms", s.LastDuration)
-		} else if suffix == "" {
-			suffix = "未就绪"
 		}
+		suffix := a.formatNodeSuffix(s)
 		lines = append(lines, fmt.Sprintf("  - [%s] [%d] %s -> %s - %s",
 			sign, s.Index+1, s.Detect, s.Value, suffix))
 	}
 	fmt.Print(strings.Join(lines, "\n") + "\n\n")
 }
 
+func compareStability(a, b *NodeState, windowSize int) int {
+	rateA := a.StabilityRate()
+	rateB := b.StabilityRate()
+
+	const epsilon = 1e-9
+	if rateA > rateB+epsilon {
+		return -1
+	}
+	if rateB > rateA+epsilon {
+		return 1
+	}
+
+	streakA := a.EventOkStreak()
+	streakB := b.EventOkStreak()
+	if streakA > streakB {
+		return -1
+	}
+	if streakB > streakA {
+		return 1
+	}
+
+	return 0
+}
+
+func compareLatency(a, b *NodeState) int {
+	if a.LastDuration < b.LastDuration {
+		return -1
+	}
+	if a.LastDuration > b.LastDuration {
+		return 1
+	}
+	return 0
+}
+
+func comparePriority(a, b *NodeState) int {
+	if a.Index < b.Index {
+		return -1
+	}
+	if a.Index > b.Index {
+		return 1
+	}
+	return 0
+}
+
+func compareNodesWithStrategies(a, b *NodeState, strategies []SwitchStrategy, windowSize int) int {
+	for _, strat := range strategies {
+		var cmp int
+		switch strat {
+		case StrategyStability:
+			cmp = compareStability(a, b, windowSize)
+		case StrategyLatency:
+			cmp = compareLatency(a, b)
+		case StrategyPriority:
+			cmp = comparePriority(a, b)
+		}
+		if cmp != 0 {
+			return cmp
+		}
+	}
+	return 0
+}
+
+func (a *FailoverApp) compareNodes(nodeA, nodeB *NodeState) int {
+	return compareNodesWithStrategies(nodeA, nodeB, a.cfg.SwitchStrategies, a.cfg.StabilityWindow)
+}
+
 func (a *FailoverApp) evaluateTarget() Decision {
-	if a.cfg.SwitchMode == string(SwitchModeLatency) {
-		bestIndex := -1
-		var minLatency int64 = -1
-
-		for i, s := range a.state {
-			if s.Status == StatusHealthy {
-				if bestIndex == -1 || s.LastDuration < minLatency {
-					bestIndex = i
-					minLatency = s.LastDuration
-				}
-			}
-		}
-
-		if bestIndex == -1 {
-			return Decision{TargetIndex: -1}
-		}
-
-		if a.activeIndex != -1 && a.state[a.activeIndex].Status == StatusHealthy {
-			if a.state[a.activeIndex].LastDuration <= minLatency {
-				return Decision{TargetIndex: a.activeIndex}
-			}
-			return Decision{TargetIndex: bestIndex}
-		}
-
-		return Decision{TargetIndex: bestIndex}
-	}
-
-	healthyIndex := -1
-	for i, s := range a.state {
+	var healthyNodes []*NodeState
+	for _, s := range a.state {
 		if s.Status == StatusHealthy {
-			healthyIndex = i
-			break
+			healthyNodes = append(healthyNodes, s)
 		}
 	}
 
-	// 1. 当前活跃候选仍健康: 仅当更高优先级的候选确认就绪时才执行回切抢占
-	if a.activeIndex != -1 && a.state[a.activeIndex].Status == StatusHealthy {
-		if healthyIndex != -1 && healthyIndex < a.activeIndex {
-			return Decision{TargetIndex: healthyIndex}
+	if len(healthyNodes) == 0 {
+		return Decision{TargetIndex: -1}
+	}
+
+	best := healthyNodes[0]
+	for _, cand := range healthyNodes[1:] {
+		if a.compareNodes(cand, best) < 0 {
+			best = cand
+		}
+	}
+
+	// 1. 若当前活跃候选仍健康:
+	// 若最佳候选严格优于当前活跃节点则切换; 若平局或当前活跃节点已是最优则保持活跃节点
+	if a.activeIndex >= 0 && a.activeIndex < len(a.state) && a.state[a.activeIndex].Status == StatusHealthy {
+		activeNode := a.state[a.activeIndex]
+		if a.compareNodes(best, activeNode) < 0 {
+			return Decision{TargetIndex: best.Index}
 		}
 		return Decision{TargetIndex: a.activeIndex}
 	}
 
-	// 2. 当前活跃节点不可用或冷启动尚未绑定: 选择当前最高优先级的已就绪健康候选
-	if healthyIndex != -1 {
-		return Decision{TargetIndex: healthyIndex}
-	}
-
-	// 3. 所有候选均无就绪健康节点: 保持现状
-	return Decision{TargetIndex: -1}
+	// 2. 当前活跃节点不可用或冷启动尚未绑定: 选择健康候选中的最佳节点
+	return Decision{TargetIndex: best.Index}
 }
 
 func (a *FailoverApp) switchTo(targetIndex int) {
@@ -1117,6 +1306,12 @@ func (a *FailoverApp) switchTo(targetIndex int) {
 	logInfo("切换候选失败: %s", patchErr.Error())
 }
 
+func (a *FailoverApp) recordEventRound(results []probeResult) {
+	for i, s := range a.state {
+		s.RecordProbe(results[i].ok, a.cfg.StabilityWindow)
+	}
+}
+
 func (a *FailoverApp) RunCycle() {
 	a.runningMu.Lock()
 	if a.isRunning {
@@ -1143,6 +1338,7 @@ func (a *FailoverApp) RunCycle() {
 	}
 	wg.Wait()
 
+	recordedThisRound := false
 	if !a.initialProbed {
 		// 初始候选状态为启动后的第一次探测结果, 不遵循 fail_count/rise_count, 每个节点各完成第一次探测时即可打印
 		for i, s := range a.state {
@@ -1160,12 +1356,23 @@ func (a *FailoverApp) RunCycle() {
 				s.LastError = res.errStr
 			}
 		}
+		a.recordEventRound(results)
+		recordedThisRound = true
 		a.initialProbed = true
 		a.printInitialStatus()
 	} else {
 		// 后续探测周期遵循 fail_count / rise_count
+		// 仅在实际发生候选状态变更（节点健康状态变化或候选切换）时，才记录本轮测试结果至历史稳定性
+		var anyStatusChanged bool
 		for i, s := range a.state {
-			a.applyProbeResult(s, results[i])
+			if a.applyProbeResult(s, results[i]) {
+				anyStatusChanged = true
+			}
+		}
+
+		if anyStatusChanged {
+			a.recordEventRound(results)
+			recordedThisRound = true
 		}
 	}
 
@@ -1175,6 +1382,10 @@ func (a *FailoverApp) RunCycle() {
 	}
 
 	if decision.TargetIndex != a.activeIndex {
+		// 若本轮尚未记录，但触发了候选切换（也是实际候选状态变更），记录本轮测试结果
+		if !recordedThisRound {
+			a.recordEventRound(results)
+		}
 		a.switchTo(decision.TargetIndex)
 	}
 }
@@ -1193,8 +1404,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	logInfo("启动 cf-dns-failover: loop_time=%ds probe_count=%d probe_retry=%d sync_candidate_dns=%v 候选数=%d",
-		cfg.LoopTime, cfg.ProbeCount, cfg.ProbeRetry, cfg.SyncCandidateDNS, len(cfg.List))
+	logInfo("启动 cf-dns-failover: loop_time=%ds probe_count=%d probe_retry=%d switch_mode=%s sync_candidate_dns=%v 候选数=%d",
+		cfg.LoopTime, cfg.ProbeCount, cfg.ProbeRetry, cfg.SwitchMode, cfg.SyncCandidateDNS, len(cfg.List))
 
 	app, err := NewFailoverApp(cfg)
 	if err != nil {

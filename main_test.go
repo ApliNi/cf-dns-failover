@@ -195,6 +195,12 @@ func TestLoadConfig_RealConfigFile(t *testing.T) {
 	if cfg.CF.RecordName != "xxx.xxx.cc" {
 		t.Errorf("cfg.CF.RecordName 期望为 xxx.xxx.cc, 实际为 %s", cfg.CF.RecordName)
 	}
+	if cfg.SwitchMode != "stability,latency,priority" {
+		t.Errorf("cfg.SwitchMode 期望为 stability,latency,priority, 实际为 %s", cfg.SwitchMode)
+	}
+	if cfg.StabilityWindow != 30 {
+		t.Errorf("cfg.StabilityWindow 期望为 30, 实际为 %d", cfg.StabilityWindow)
+	}
 }
 
 func TestSyncCandidateDnsRecords_Disabled(t *testing.T) {
@@ -829,3 +835,562 @@ func TestSyncCandidateDnsRecords_PatchAuthError(t *testing.T) {
 		t.Fatalf("返回的错误信息不包含鉴权信息: %v", err)
 	}
 }
+
+func TestParseSwitchMode(t *testing.T) {
+	tests := []struct {
+		input       string
+		expected    []SwitchStrategy
+		expectedStr string
+		expectErr   bool
+	}{
+		{"", []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority}, "stability,latency,priority", false},
+		{"   ", []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority}, "stability,latency,priority", false},
+		{"priority", []SwitchStrategy{StrategyPriority}, "priority", false},
+		{"latency", []SwitchStrategy{StrategyLatency}, "latency", false},
+		{"stability", []SwitchStrategy{StrategyStability}, "stability", false},
+		{"latency,priority", []SwitchStrategy{StrategyLatency, StrategyPriority}, "latency,priority", false},
+		{"latency, priority", []SwitchStrategy{StrategyLatency, StrategyPriority}, "latency,priority", false},
+		{"latency，priority", []SwitchStrategy{StrategyLatency, StrategyPriority}, "latency,priority", false},
+		{"stability > latency -> priority", []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority}, "stability,latency,priority", false},
+		{"历史稳定性 > 最低延迟 -> 列表顺序", []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority}, "stability,latency,priority", false},
+		{"stable,rtt,order", []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority}, "stability,latency,priority", false},
+		{"history,min_latency,list", []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority}, "stability,latency,priority", false},
+		{"稳定性,延迟,优先级", []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority}, "stability,latency,priority", false},
+		{"latency,latency", []SwitchStrategy{StrategyLatency}, "latency", false},
+		{"invalid_strategy", nil, "", true},
+		{"latency,invalid", nil, "", true},
+	}
+
+	for _, tc := range tests {
+		strategies, str, err := parseSwitchMode(tc.input)
+		if tc.expectErr {
+			if err == nil {
+				t.Errorf("输入 %q 期望报错，但成功解析为 %v", tc.input, strategies)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("输入 %q 意外报错: %v", tc.input, err)
+			continue
+		}
+		if str != tc.expectedStr {
+			t.Errorf("输入 %q 规范化字符串期望 %q, 实际 %q", tc.input, tc.expectedStr, str)
+		}
+		if len(strategies) != len(tc.expected) {
+			t.Fatalf("输入 %q 策略长度期望 %d, 实际 %d", tc.input, len(tc.expected), len(strategies))
+		}
+		for i := range strategies {
+			if strategies[i] != tc.expected[i] {
+				t.Errorf("输入 %q 策略[%d] 期望 %s, 实际 %s", tc.input, i, tc.expected[i], strategies[i])
+			}
+		}
+	}
+}
+
+func TestNodeState_RecordProbeAndStabilityRate(t *testing.T) {
+	node := &NodeState{}
+	if rate := node.StabilityRate(); rate != 0.0 {
+		t.Errorf("空历史期望可用率 0.0, 实际 %f", rate)
+	}
+
+	window := 5
+	// 记录 3 次成功
+	node.RecordProbe(true, window)
+	node.RecordProbe(true, window)
+	node.RecordProbe(true, window)
+	if len(node.History) != 3 {
+		t.Fatalf("历史长度期望 3, 实际 %d", len(node.History))
+	}
+	if rate := node.StabilityRate(); rate != 1.0 {
+		t.Errorf("期望可用率 1.0, 实际 %f", rate)
+	}
+
+	// 记录 2 次失败
+	node.RecordProbe(false, window)
+	node.RecordProbe(false, window)
+	if len(node.History) != 5 {
+		t.Fatalf("历史长度期望 5, 实际 %d", len(node.History))
+	}
+	if rate := node.StabilityRate(); rate != 0.6 {
+		t.Errorf("期望可用率 0.6, 实际 %f", rate)
+	}
+
+	// 超过窗口，触发滑动窗口淘汰 (新记录 2 次成功，淘汰最早的 2 次成功)
+	node.RecordProbe(true, window)
+	node.RecordProbe(true, window)
+	if len(node.History) != 5 {
+		t.Fatalf("超出窗口长度期望维持在 5, 实际 %d", len(node.History))
+	}
+	// 当前历史: [true, false, false, true, true] => 3/5 = 0.6
+	if rate := node.StabilityRate(); rate != 0.6 {
+		t.Errorf("滑动后期望可用率 0.6, 实际 %f", rate)
+	}
+}
+
+func TestComparators(t *testing.T) {
+	t.Run("comparePriority", func(t *testing.T) {
+		a := &NodeState{Index: 0}
+		b := &NodeState{Index: 1}
+		if cmp := comparePriority(a, b); cmp >= 0 {
+			t.Errorf("期望 a 优于 b, 实际 cmp=%d", cmp)
+		}
+		if cmp := comparePriority(b, a); cmp <= 0 {
+			t.Errorf("期望 b 劣于 a, 实际 cmp=%d", cmp)
+		}
+		if cmp := comparePriority(a, a); cmp != 0 {
+			t.Errorf("期望平局, 实际 cmp=%d", cmp)
+		}
+	})
+
+	t.Run("compareLatency", func(t *testing.T) {
+		a := &NodeState{LastDuration: 20}
+		b := &NodeState{LastDuration: 50}
+		if cmp := compareLatency(a, b); cmp >= 0 {
+			t.Errorf("期望 a 优于 b, 实际 cmp=%d", cmp)
+		}
+		if cmp := compareLatency(b, a); cmp <= 0 {
+			t.Errorf("期望 b 劣于 a, 实际 cmp=%d", cmp)
+		}
+		if cmp := compareLatency(a, a); cmp != 0 {
+			t.Errorf("期望平局, 实际 cmp=%d", cmp)
+		}
+	})
+
+	t.Run("compareStability", func(t *testing.T) {
+		// 1. 可用率不同: 可用率高者胜
+		a := &NodeState{History: []bool{true, true, true}}  // 100%
+		b := &NodeState{History: []bool{true, false, true}} // 66.7%
+		if cmp := compareStability(a, b, 10); cmp >= 0 {
+			t.Errorf("期望 a(100%%) 优于 b(66.7%%), 实际 cmp=%d", cmp)
+		}
+
+		// 2. 可用率相同 (如均 75%): 历史末尾连续保持正常次数(EventOkStreak)更多者胜
+		c := &NodeState{History: []bool{true, true, false, true}} // 3/4=75%, streak=1
+		d := &NodeState{History: []bool{false, true, true, true}} // 3/4=75%, streak=3
+		if cmp := compareStability(c, d, 10); cmp <= 0 {
+			t.Errorf("期望 d(eventStreak=3) 优于 c(eventStreak=1), 实际 cmp=%d", cmp)
+		}
+
+		// 3. 可用率与历史末尾连续保持正常次数均相同: 平局
+		e := &NodeState{History: []bool{true, true, true}}
+		f := &NodeState{History: []bool{true, true, true}}
+		if cmp := compareStability(e, f, 30); cmp != 0 {
+			t.Errorf("期望历史完全相同表现为平局, 实际 cmp=%d", cmp)
+		}
+	})
+
+	t.Run("compareNodesWithStrategies_Cascade", func(t *testing.T) {
+		strategies := []SwitchStrategy{StrategyLatency, StrategyPriority}
+		// 延迟不同时，仅比延迟
+		a := &NodeState{Index: 1, LastDuration: 10}
+		b := &NodeState{Index: 0, LastDuration: 20}
+		if cmp := compareNodesWithStrategies(a, b, strategies, 30); cmp >= 0 {
+			t.Errorf("期望 a 胜出 (较低延迟), 实际 cmp=%d", cmp)
+		}
+
+		// 延迟相同时，由第二级 priority 决定
+		c := &NodeState{Index: 0, LastDuration: 20}
+		d := &NodeState{Index: 1, LastDuration: 20}
+		if cmp := compareNodesWithStrategies(c, d, strategies, 30); cmp >= 0 {
+			t.Errorf("期望 c 胜出 (相同延迟，较小索引), 实际 cmp=%d", cmp)
+		}
+	})
+}
+
+func TestEvaluateTarget_Modes(t *testing.T) {
+	t.Run("AllUnhealthy", func(t *testing.T) {
+		app := &FailoverApp{
+			cfg: &Config{
+				SwitchStrategies: DefaultSwitchStrategies,
+				StabilityWindow:  30,
+			},
+			state: []*NodeState{
+				{Index: 0, Status: StatusUnhealthy},
+				{Index: 1, Status: StatusUnhealthy},
+			},
+			activeIndex: -1,
+		}
+		dec := app.evaluateTarget()
+		if dec.TargetIndex != -1 {
+			t.Errorf("全不可用节点期望 TargetIndex=-1, 实际 %d", dec.TargetIndex)
+		}
+	})
+
+	t.Run("PriorityPreemption", func(t *testing.T) {
+		app := &FailoverApp{
+			cfg: &Config{
+				SwitchStrategies: []SwitchStrategy{StrategyPriority},
+			},
+			state: []*NodeState{
+				{Index: 0, Status: StatusHealthy},
+				{Index: 1, Status: StatusHealthy},
+			},
+			activeIndex: 1, // 当前活跃是 1
+		}
+		// 节点 0 优先级更高，回切抢占
+		dec := app.evaluateTarget()
+		if dec.TargetIndex != 0 {
+			t.Errorf("期望回切抢占到节点 0, 实际 %d", dec.TargetIndex)
+		}
+	})
+
+	t.Run("LatencyEqualTieKeepsActive", func(t *testing.T) {
+		app := &FailoverApp{
+			cfg: &Config{
+				SwitchStrategies: []SwitchStrategy{StrategyLatency},
+			},
+			state: []*NodeState{
+				{Index: 0, Status: StatusHealthy, LastDuration: 50},
+				{Index: 1, Status: StatusHealthy, LastDuration: 50},
+			},
+			activeIndex: 1, // 当前活跃是 1，且两者延迟相同
+		}
+		// 仅配置 latency 且平局时，应保持当前健康节点 1，防止震荡
+		dec := app.evaluateTarget()
+		if dec.TargetIndex != 1 {
+			t.Errorf("期望平局保持活跃节点 1, 实际 %d", dec.TargetIndex)
+		}
+	})
+
+	t.Run("LatencyPriorityCascading", func(t *testing.T) {
+		app := &FailoverApp{
+			cfg: &Config{
+				SwitchStrategies: []SwitchStrategy{StrategyLatency, StrategyPriority},
+			},
+			state: []*NodeState{
+				{Index: 0, Status: StatusHealthy, LastDuration: 50},
+				{Index: 1, Status: StatusHealthy, LastDuration: 50},
+			},
+			activeIndex: 1,
+		}
+		// 延迟相同时，按 priority 决胜负，节点 0 (index 0) 优于节点 1
+		dec := app.evaluateTarget()
+		if dec.TargetIndex != 0 {
+			t.Errorf("期望多级策略决胜负切换到节点 0, 实际 %d", dec.TargetIndex)
+		}
+	})
+
+	t.Run("DefaultStabilityProtectsActive", func(t *testing.T) {
+		app := &FailoverApp{
+			cfg: &Config{
+				SwitchStrategies: DefaultSwitchStrategies, // stability, latency, priority
+				StabilityWindow:  30,
+			},
+			state: []*NodeState{
+				// 节点 0 在过往发生过故障，恢复后当前稳定性为 2/3 (66.7%)
+				{Index: 0, Status: StatusHealthy, LastDuration: 10, History: []bool{true, false, true}},
+				// 节点 1 经历所有变更均保持正常，稳定性为 3/3 (100%)
+				{Index: 1, Status: StatusHealthy, LastDuration: 50, History: []bool{true, true, true}},
+			},
+			activeIndex: 1,
+		}
+
+		// 虽然节点 0 延迟更低且列表靠前，但节点 1 历史稳定性更高，因此不发生切换
+		dec := app.evaluateTarget()
+		if dec.TargetIndex != 1 {
+			t.Errorf("期望历史稳定性保护活跃节点 1，但切换到了 %d", dec.TargetIndex)
+		}
+
+		// 当节点 0 与节点 1 历史上均保持 100% 稳定时，进入下一级延迟比较，切换到更快的节点 0
+		app.state[0].History = []bool{true, true, true}
+		dec2 := app.evaluateTarget()
+		if dec2.TargetIndex != 0 {
+			t.Errorf("期望两者均稳定后按延迟切换到节点 0, 实际 %d", dec2.TargetIndex)
+		}
+	})
+}
+
+func TestFormatNodeSuffix(t *testing.T) {
+	appWithStability := &FailoverApp{
+		cfg: &Config{
+			SwitchStrategies: []SwitchStrategy{StrategyStability, StrategyLatency, StrategyPriority},
+		},
+	}
+	nodeHealthy := &NodeState{
+		Status:       StatusHealthy,
+		LastDuration: 45,
+		History:      []bool{true, true},
+	}
+	suffix := appWithStability.formatNodeSuffix(nodeHealthy)
+	if suffix != "45ms (稳定性 100%)" {
+		t.Errorf("期望 '45ms (稳定性 100%%)', 实际 %q", suffix)
+	}
+
+	appWithoutStability := &FailoverApp{
+		cfg: &Config{
+			SwitchStrategies: []SwitchStrategy{StrategyLatency, StrategyPriority},
+		},
+	}
+	suffixNoStab := appWithoutStability.formatNodeSuffix(nodeHealthy)
+	if suffixNoStab != "45ms" {
+		t.Errorf("期望 '45ms', 实际 %q", suffixNoStab)
+	}
+
+	nodeUnhealthy := &NodeState{
+		Status:    StatusUnhealthy,
+		LastError: "请求超时",
+	}
+	suffixErr := appWithStability.formatNodeSuffix(nodeUnhealthy)
+	if suffixErr != "请求超时" {
+		t.Errorf("期望 '请求超时', 实际 %q", suffixErr)
+	}
+}
+
+func TestLoadConfig_SwitchModeAndWindow(t *testing.T) {
+	content := `
+switch_mode: "latency, priority"
+stability_window: 50
+cf:
+  record_name: "test.example.com"
+list:
+  - detect: "https://node1.example.com"
+    value: "target1.com"
+`
+	path := writeTempConfigFile(t, content)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig 失败: %v", err)
+	}
+	if cfg.SwitchMode != "latency,priority" {
+		t.Errorf("期望 SwitchMode 为 latency,priority, 实际 %s", cfg.SwitchMode)
+	}
+	if len(cfg.SwitchStrategies) != 2 || cfg.SwitchStrategies[0] != StrategyLatency || cfg.SwitchStrategies[1] != StrategyPriority {
+		t.Errorf("期望 SwitchStrategies 为 [latency, priority], 实际 %v", cfg.SwitchStrategies)
+	}
+	if cfg.StabilityWindow != 50 {
+		t.Errorf("期望 StabilityWindow 为 50, 实际 %d", cfg.StabilityWindow)
+	}
+}
+
+func TestLoadConfig_DefaultSwitchModeAndWindow(t *testing.T) {
+	content := `
+cf:
+  record_name: "test.example.com"
+list:
+  - detect: "https://node1.example.com"
+    value: "target1.com"
+`
+	path := writeTempConfigFile(t, content)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig 失败: %v", err)
+	}
+	if cfg.SwitchMode != "stability,latency,priority" {
+		t.Errorf("期望默认 SwitchMode 为 stability,latency,priority, 实际 %s", cfg.SwitchMode)
+	}
+	if len(cfg.SwitchStrategies) != 3 || cfg.SwitchStrategies[0] != StrategyStability || cfg.SwitchStrategies[1] != StrategyLatency || cfg.SwitchStrategies[2] != StrategyPriority {
+		t.Errorf("期望默认 SwitchStrategies 为 [stability, latency, priority], 实际 %v", cfg.SwitchStrategies)
+	}
+	if cfg.StabilityWindow != DefaultStabilityWindow {
+		t.Errorf("期望默认 StabilityWindow 为 %d, 实际 %d", DefaultStabilityWindow, cfg.StabilityWindow)
+	}
+}
+
+func TestLoadConfig_InvalidSwitchMode(t *testing.T) {
+	content := `
+switch_mode: "latency,unknown_strategy"
+cf:
+  record_name: "test.example.com"
+`
+	path := writeTempConfigFile(t, content)
+	_, err := loadConfig(path)
+	if err == nil {
+		t.Fatalf("期望非法 switch_mode 返回 error")
+	}
+}
+
+func TestLoadConfig_SwitchModeYAMLList(t *testing.T) {
+	content := `
+switch_mode:
+  - latency
+  - priority
+cf:
+  record_name: "test.example.com"
+list:
+  - detect: "https://node1.example.com"
+    value: "target1.com"
+`
+	path := writeTempConfigFile(t, content)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig 解析 YAML 列表 switch_mode 失败: %v", err)
+	}
+	if cfg.SwitchMode != "latency,priority" {
+		t.Errorf("期望 SwitchMode 为 latency,priority, 实际 %s", cfg.SwitchMode)
+	}
+	if len(cfg.SwitchStrategies) != 2 || cfg.SwitchStrategies[0] != StrategyLatency || cfg.SwitchStrategies[1] != StrategyPriority {
+		t.Errorf("期望 SwitchStrategies 为 [latency, priority], 实际 %v", cfg.SwitchStrategies)
+	}
+}
+
+func TestFormatNodeSuffix_FloatingPrecision(t *testing.T) {
+	app := &FailoverApp{
+		cfg: &Config{
+			SwitchStrategies: []SwitchStrategy{StrategyStability},
+		},
+	}
+
+	// 11 次成功，9 次失败 => 11/20 = 55%
+	// 在 IEEE 754 浮点下 11/20 * 100 会产生 55.00000000000001
+	var history []bool
+	for range 11 {
+		history = append(history, true)
+	}
+	for range 9 {
+		history = append(history, false)
+	}
+	node := &NodeState{
+		Status:       StatusHealthy,
+		LastDuration: 30,
+		History:      history,
+	}
+	suffix := app.formatNodeSuffix(node)
+	if suffix != "30ms (稳定性 55%)" {
+		t.Errorf("期望 '30ms (稳定性 55%%)', 实际 %q", suffix)
+	}
+}
+
+func TestHasStabilityStrategy_NilSafe(t *testing.T) {
+	var nilApp *FailoverApp
+	if nilApp.hasStabilityStrategy() {
+		t.Errorf("nil app 期望返回 false")
+	}
+
+	appNoCfg := &FailoverApp{}
+	if appNoCfg.hasStabilityStrategy() {
+		t.Errorf("app with nil cfg 期望返回 false")
+	}
+}
+
+func TestRunCycle_HistoryOnlyRecordedOnCandidateStatusChange(t *testing.T) {
+	var node0Fail atomic.Bool
+	node0Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if node0Fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer node0Server.Close()
+
+	node1Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer node1Server.Close()
+
+	cfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(CFResponse{
+			Success: true,
+			Result: []DnsRecord{
+				{ID: "rec-test", Name: "main.example.com", Content: "target1.com", Type: "CNAME"},
+			},
+		})
+	}))
+	defer cfServer.Close()
+
+	cfg := &Config{
+		LoopTime:         10,
+		ProbeCount:       2,
+		ProbeRetry:       1,
+		ProbeTimeout:     2,
+		StabilityWindow:  10,
+		SwitchStrategies: []SwitchStrategy{StrategyStability, StrategyPriority}, // 使用 stability,priority 避免本机回环 0ms/1ms 时钟误差干扰
+		SwitchMode:       "stability,priority",
+		CF: CFConfig{
+			ZoneID:     "zone-test",
+			RecordName: "main.example.com",
+			RecordType: "CNAME",
+			APIToken:   "token",
+		},
+		List: []CandidateNode{
+			{Detect: node0Server.URL, Value: "target0.com"},
+			{Detect: node1Server.URL, Value: "target1.com"},
+		},
+	}
+
+	app, err := NewFailoverApp(cfg)
+	if err != nil {
+		t.Fatalf("NewFailoverApp 失败: %v", err)
+	}
+	app.cfBaseURL = cfServer.URL
+	app.dnsRecordID = "rec-test"
+	app.activeIndex = 0 // 假设初始指向节点 0
+
+	// 1. 第 1 轮探测: 初始探测基线建立 (记录第 1 条测试结果)
+	app.RunCycle()
+	if len(app.state[0].History) != 1 || len(app.state[1].History) != 1 {
+		t.Fatalf("初始探测后各节点期望 History 长度为 1, 实际 [0]=%d, [1]=%d",
+			len(app.state[0].History), len(app.state[1].History))
+	}
+	if !app.state[0].History[0] || !app.state[1].History[0] {
+		t.Fatalf("初始探测各节点期望为 true")
+	}
+
+	// 2. 第 2~3 轮探测: 正常例行探测，节点健康且无任何候选状态变更
+	app.RunCycle()
+	app.RunCycle()
+	if len(app.state[0].History) != 1 || len(app.state[1].History) != 1 {
+		t.Fatalf("无候选状态变更的常规探测中，History 长度应保持为 1 不得递增, 实际 [0]=%d, [1]=%d",
+			len(app.state[0].History), len(app.state[1].History))
+	}
+
+	// 3. 节点 0 出现故障
+	node0Fail.Store(true)
+
+	// 失败第 1 次: probe_count=2，尚未达到阈值，节点 0 状态仍为健康，无变更
+	app.RunCycle()
+	if len(app.state[0].History) != 1 {
+		t.Fatalf("节点 0 失败 1 次尚未翻转状态前，History 长度应保持为 1, 实际 %d", len(app.state[0].History))
+	}
+
+	// 失败第 2 次: 达到 probe_count=2，节点 0 翻转为 Unhealthy，触发候选状态变更并切换到节点 1
+	app.RunCycle()
+	if len(app.state[0].History) != 2 || len(app.state[1].History) != 2 {
+		t.Fatalf("节点 0 状态翻转发生候选状态变更后，各节点 History 期望长度为 2, 实际 [0]=%d, [1]=%d",
+			len(app.state[0].History), len(app.state[1].History))
+	}
+	if app.state[0].History[1] != false {
+		t.Errorf("节点 0 在故障变更时刻的记录期望为 false")
+	}
+	if app.state[1].History[1] != true {
+		t.Errorf("节点 1 在故障变更时刻的记录期望为 true")
+	}
+	if app.activeIndex != 1 {
+		t.Errorf("期望切换到健康的活跃候选 1, 实际 %d", app.activeIndex)
+	}
+
+	// 4. 故障持续期间常规探测，状态保持不变，不递增记录
+	app.RunCycle()
+	app.RunCycle()
+	if len(app.state[0].History) != 2 {
+		t.Fatalf("节点 0 持续故障但状态未再度翻转时，History 长度应维持 2, 实际 %d", len(app.state[0].History))
+	}
+
+	// 5. 节点 0 恢复正常
+	node0Fail.Store(false)
+
+	// 成功第 1 次: probe_count=2，未达就绪阈值，状态仍为 Unhealthy，无变更
+	app.RunCycle()
+	if len(app.state[0].History) != 2 {
+		t.Fatalf("节点 0 成功 1 次尚未恢复健康前，History 长度应维持 2, 实际 %d", len(app.state[0].History))
+	}
+
+	// 成功第 2 次: 节点 0 恢复为 StatusHealthy，触发节点状态翻转，写入变更时刻测试结果
+	app.RunCycle()
+	if len(app.state[0].History) != 3 || len(app.state[1].History) != 3 {
+		t.Fatalf("节点 0 恢复健康发生候选状态变更后，History 长度期望为 3, 实际 [0]=%d, [1]=%d",
+			len(app.state[0].History), len(app.state[1].History))
+	}
+	if app.state[0].History[2] != true {
+		t.Errorf("节点 0 恢复时刻记录期望为 true")
+	}
+
+	// 节点 0 历史记录为 [true, false, true] => 2/3 = 66.7%
+	// 节点 1 历史记录为 [true, true, true]   => 3/3 = 100%
+	// 在 stability,latency,priority 模式下，节点 1 历史稳定性更高，故保护活跃节点 1，不发生回切抢占
+	if app.activeIndex != 1 {
+		t.Errorf("刚恢复的节点 0 历史稳定性(66.7%%)劣于持续健康的节点 1(100%%)，期望继续保持活跃节点 1, 实际切到了 %d", app.activeIndex)
+	}
+}
+
